@@ -1,12 +1,30 @@
+import contextlib
+import itertools
 import sys
+from typing import List
 
+import msgspec
 import pytest
-from vllm.distributed.kv_events import ZmqEventPublisher
+from vllm.distributed.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    KVEventBatch,
+    ZmqEventPublisher,
+)
 
+import ray
+from ray._common.test_utils import async_wait_for_condition
 from ray.llm._internal.serve.core.configs.llm_config import LLMConfig
 from ray.llm._internal.serve.core.server.builder import build_llm_deployment
 from ray.llm._internal.serve.engines.vllm.kv_transfer.factory import (
     KVConnectorBackendFactory,
+)
+from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_actor import (
+    KVRouterActor,
+)
+from ray.llm._internal.serve.routing_policies.kv_aware.kv_event_publisher import (
+    KvEventPublisher,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_events import (
     DYNAMO_KV_CONNECTOR,
@@ -17,6 +35,9 @@ from ray.llm._internal.serve.routing_policies.kv_aware.kv_events import (
     resolve_kv_event_source_endpoint,
 )
 from ray.serve.llm.request_router import KVAwareRouter
+
+BLOCK_SIZE = 16
+WORKER_ID = 7001
 
 
 def make_llm_config(**kwargs) -> LLMConfig:
@@ -37,6 +58,18 @@ def make_kv_aware_llm_config(**kwargs) -> LLMConfig:
             "request_router_config": {"request_router_class": KVAwareRouter},
         },
         **kwargs,
+    )
+
+
+def stored(block_hashes, token_ids, parent=None, block_size=BLOCK_SIZE):
+    return BlockStored(
+        block_hashes=block_hashes,
+        parent_block_hash=parent,
+        token_ids=token_ids,
+        block_size=block_size,
+        lora_id=None,
+        medium="GPU",
+        lora_name=None,
     )
 
 
@@ -226,6 +259,238 @@ class TestReplicaEndpoints:
         llm_config = make_kv_aware_llm_config()
         with pytest.raises(ValueError, match="kv_events_config"):
             resolve_consolidator_endpoints(llm_config)
+
+
+@pytest.fixture(scope="module")
+def ray_instance():
+    if not ray.is_initialized():
+        ray.init(address="auto")
+    yield
+
+
+@ray.remote(num_cpus=0)
+class LocalKVRouterActor(KVRouterActor.__ray_actor_class__):
+    """The real KVRouterActor with replica tracking disabled (no Serve
+    controller in these tests)."""
+
+    def _start_replica_tracking(self) -> None:
+        pass
+
+
+_test_ports = itertools.count(21811)
+
+
+def make_bridge(actor, port, worker_id=WORKER_ID):
+    return KvEventPublisher(
+        kv_router_actor=actor,
+        worker_id=worker_id,
+        kv_block_size=BLOCK_SIZE,
+        zmq_endpoint=f"tcp://127.0.0.1:{port}",
+    )
+
+
+async def publish_and_wait(actor, engine_publisher, batches: List[KVEventBatch]):
+    """Publish batches and wait until the actor has consumed all of them."""
+    counts_before = sum(
+        sum(c.values()) for c in (await actor.get_kv_event_counts.remote()).values()
+    )
+    num_events = sum(len(b.events) for b in batches)
+    for batch in batches:
+        engine_publisher.publish(batch)
+
+    async def consumed():
+        counts = await actor.get_kv_event_counts.remote()
+        return (
+            sum(sum(c.values()) for c in counts.values()) == counts_before + num_events
+        )
+
+    await async_wait_for_condition(consumed, timeout=10)
+
+
+class TestKvEventPipeline:
+    """End-to-end: vLLM's production ZMQ publisher -> KvEventPublisher bridge
+    -> KVRouterActor's KvEventConsumer."""
+
+    @pytest.mark.asyncio
+    async def test_stored_removed_cleared(self, ray_instance):
+        actor = LocalKVRouterActor.remote()
+        port = next(_test_ports)
+        engine_pub = ZmqEventPublisher(
+            data_parallel_rank=0, endpoint=f"tcp://*:{port}", topic=""
+        )
+        bridge = make_bridge(actor, port)
+        try:
+            # Two chained blocks stored, then one removed.
+            await publish_and_wait(
+                actor,
+                engine_pub,
+                [
+                    KVEventBatch(
+                        ts=1.0,
+                        events=[stored([11, 22], list(range(2 * BLOCK_SIZE)))],
+                    ),
+                    KVEventBatch(
+                        ts=2.0, events=[BlockRemoved(block_hashes=[11], medium="GPU")]
+                    ),
+                ],
+            )
+            assert await actor.get_kv_event_worker_ids.remote() == [WORKER_ID]
+            blocks = await actor.get_kv_cached_blocks.remote(WORKER_ID)
+            assert blocks == {22: list(range(BLOCK_SIZE, 2 * BLOCK_SIZE))}
+
+            await publish_and_wait(
+                actor, engine_pub, [KVEventBatch(ts=3.0, events=[AllBlocksCleared()])]
+            )
+            assert await actor.get_kv_cached_blocks.remote(WORKER_ID) == {}
+            assert (await actor.get_kv_event_counts.remote())[WORKER_ID] == {
+                "block_stored": 1,
+                "block_removed": 1,
+                "all_blocks_cleared": 1,
+            }
+        finally:
+            await bridge.close()
+            engine_pub.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_per_worker_isolation_and_removal(self, ray_instance):
+        """Two replicas' bridges feed the same actor without cross-talk, and
+        worker removal drops the departed worker's state."""
+        actor = LocalKVRouterActor.remote()
+        ports = (next(_test_ports), next(_test_ports))
+        worker_ids = (7001, 7002)
+        engine_pubs = [
+            ZmqEventPublisher(data_parallel_rank=0, endpoint=f"tcp://*:{p}", topic="")
+            for p in ports
+        ]
+        bridges = [
+            make_bridge(actor, port, worker_id)
+            for port, worker_id in zip(ports, worker_ids)
+        ]
+        try:
+            for i, engine_pub in enumerate(engine_pubs):
+                await publish_and_wait(
+                    actor,
+                    engine_pub,
+                    [
+                        KVEventBatch(
+                            ts=1.0,
+                            events=[stored([100 + i], list(range(BLOCK_SIZE)))],
+                        )
+                    ],
+                )
+
+            assert await actor.get_kv_event_worker_ids.remote() == list(worker_ids)
+            assert set(await actor.get_kv_cached_blocks.remote(worker_ids[0])) == {100}
+            assert set(await actor.get_kv_cached_blocks.remote(worker_ids[1])) == {101}
+
+            await actor.remove_worker.remote(worker_ids[0])
+            assert await actor.get_kv_event_worker_ids.remote() == [worker_ids[1]]
+            assert await actor.get_kv_cached_blocks.remote(worker_ids[0]) == {}
+        finally:
+            for bridge in bridges:
+                await bridge.close()
+            for engine_pub in engine_pubs:
+                engine_pub.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_in_order_application_under_flood(self, ray_instance):
+        """Store/remove churn on the same hashes lands in publish order: the
+        bridge keeps exactly one actor call in flight."""
+        actor = LocalKVRouterActor.remote()
+        port = next(_test_ports)
+        engine_pub = ZmqEventPublisher(
+            data_parallel_rank=0, endpoint=f"tcp://*:{port}", topic=""
+        )
+        bridge = make_bridge(actor, port)
+        try:
+            batches = []
+            for round_idx in range(100):
+                batches.append(
+                    KVEventBatch(
+                        ts=float(round_idx),
+                        events=[stored([round_idx], list(range(BLOCK_SIZE)))],
+                    )
+                )
+                # Remove every block except the final round's.
+                if round_idx < 99:
+                    batches.append(
+                        KVEventBatch(
+                            ts=float(round_idx),
+                            events=[
+                                BlockRemoved(block_hashes=[round_idx], medium="GPU")
+                            ],
+                        )
+                    )
+            await publish_and_wait(actor, engine_pub, batches)
+
+            blocks = await actor.get_kv_cached_blocks.remote(WORKER_ID)
+            assert set(blocks) == {99}
+            counts = (await actor.get_kv_event_counts.remote())[WORKER_ID]
+            assert counts == {"block_stored": 100, "block_removed": 99}
+        finally:
+            await bridge.close()
+            engine_pub.shutdown()
+
+
+class TestFrameDecoding:
+    """Frame-level behavior of the bridge, exercised without sockets."""
+
+    @staticmethod
+    def frames(batch: KVEventBatch, seq: int) -> List[bytes]:
+        payload = msgspec.msgpack.Encoder().encode(batch)
+        return [b"", seq.to_bytes(8, "big"), payload]
+
+    @contextlib.asynccontextmanager
+    async def bridge(self):
+        actor = LocalKVRouterActor.remote()
+        bridge = make_bridge(actor, next(_test_ports))
+        try:
+            yield bridge
+        finally:
+            await bridge.close()
+
+    @pytest.mark.asyncio
+    async def test_invalid_frames_are_skipped(self, ray_instance):
+        async with self.bridge() as bridge:
+            assert bridge._decode_frames([b"only-two", b"frames"]) == []
+            assert bridge._decode_frames([b"", b"short-seq", b"payload"]) == []
+
+    @pytest.mark.asyncio
+    async def test_event_ids_and_dp_rank(self, ray_instance):
+        batch = KVEventBatch(
+            ts=1.0,
+            events=[stored([1], list(range(BLOCK_SIZE))), AllBlocksCleared()],
+            data_parallel_rank=2,
+        )
+        async with self.bridge() as bridge:
+            router_events = bridge._decode_frames(self.frames(batch, seq=0))
+
+        assert [e["event_id"] for e in router_events] == [0, 1]
+        assert all(e["worker_id"] == WORKER_ID for e in router_events)
+        assert all(e["dp_rank"] == 2 for e in router_events)
+        assert router_events[0]["event"] == {
+            "type": "block_stored",
+            "block_hashes": [1],
+            "parent_block_hash": None,
+            "token_ids": list(range(BLOCK_SIZE)),
+            "block_size": BLOCK_SIZE,
+            "medium": "GPU",
+            "lora_name": None,
+        }
+        assert router_events[1]["event"] == {"type": "all_blocks_cleared"}
+
+    @pytest.mark.asyncio
+    async def test_sequence_gap_still_applies_events(self, ray_instance):
+        """A lost engine batch is logged but later events still apply."""
+        first = KVEventBatch(ts=1.0, events=[stored([1], list(range(BLOCK_SIZE)))])
+        third = KVEventBatch(ts=3.0, events=[stored([3], list(range(BLOCK_SIZE)))])
+
+        async with self.bridge() as bridge:
+            assert len(bridge._decode_frames(self.frames(first, seq=0))) == 1
+            router_events = bridge._decode_frames(self.frames(third, seq=2))
+        assert len(router_events) == 1
+        # Event ids stay monotonic across the gap.
+        assert router_events[0]["event_id"] == 1
 
 
 if __name__ == "__main__":

@@ -5,6 +5,9 @@ from typing import Any, Dict, List, Optional
 
 import ray
 from ray import serve
+from ray.llm._internal.serve.routing_policies.kv_aware.kv_event_consumer import (
+    KvEventConsumer,
+)
 from ray.serve._private.common import DeploymentTargetInfo, ReplicaID
 from ray.serve._private.constants import (
     SERVE_CONTROLLER_NAME,
@@ -34,6 +37,7 @@ class KVRouterActor:
     KVRouterActor, independent of any replica's lifetime, is attached to the LLMServer
     deployment via Serve's DeploymentActorConfig. It exposes the KV-aware routing interfaces:
     - Replica membership tracking
+    - KV event consumption
     - KV-aware scoring
 
     TODO (jeffreywang): The radix tree that backs them lands in a later PR.
@@ -42,6 +46,7 @@ class KVRouterActor:
     def __init__(self):
         self._replica_id_by_worker: Dict[int, str] = {}
         self._long_poll_client: Optional[LongPollClient] = None
+        self._kv_event_consumer = KvEventConsumer()
         self._start_replica_tracking()
 
     def _start_replica_tracking(self) -> None:
@@ -109,7 +114,28 @@ class KVRouterActor:
 
     def remove_worker(self, worker_id: int) -> None:
         """Deregister a worker from the KV router when a replica is removed."""
-        pass
+        self._kv_event_consumer.remove_worker(worker_id)
+
+    async def on_kv_events(self, router_events: List[Dict[str, Any]]) -> None:
+        """Consume a batch of KV events bridged from a replica's KvEventPublisher.
+
+        Stand-in for Dynamo's ``kv-events`` event-plane subject: each event
+        carries the worker's identity, an event id, and the engine event
+        payload, and feeds the router's (future) global KV indexer.
+        """
+        self._kv_event_consumer.consume(router_events)
+
+    async def get_kv_event_worker_ids(self) -> List[int]:
+        """Workers that have produced at least one KV event, sorted."""
+        return self._kv_event_consumer.get_worker_ids()
+
+    async def get_kv_cached_blocks(self, worker_id: int) -> Dict[Any, List[int]]:
+        """A worker's cached blocks (block hash -> token ids) seen via KV events."""
+        return self._kv_event_consumer.get_cached_blocks(worker_id)
+
+    async def get_kv_event_counts(self) -> Dict[int, Dict[str, int]]:
+        """Per-worker counts of consumed KV events by type."""
+        return self._kv_event_consumer.get_event_counts()
 
     async def select_worker(
         self,

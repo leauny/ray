@@ -22,6 +22,11 @@ DYNAMO_KV_CONNECTOR = "DynamoConnector"
 DYNAMO_KV_CONNECTOR_MODULE_PATH = "kvbm.vllm_integration.connector"
 CONSOLIDATOR_ENDPOINTS_KEY = "consolidator_endpoints"
 
+# Normalized router-event payload types bridged from the engine's KV events.
+KV_EVENT_BLOCK_STORED = "block_stored"
+KV_EVENT_BLOCK_REMOVED = "block_removed"
+KV_EVENT_ALL_BLOCKS_CLEARED = "all_blocks_cleared"
+
 
 def configure_kv_events_for_kv_routing(llm_config: "LLMConfig") -> None:
     """Enable engine KV-cache events for a KV-aware-routed deployment.
@@ -110,7 +115,7 @@ def assign_replica_kv_events_endpoint(llm_config: "LLMConfig") -> None:
 
 
 def resolve_kv_event_source_endpoint(llm_config: "LLMConfig") -> Optional[str]:
-    """The ZMQ endpoint a replica's KV-events subscriber should consume.
+    """The ZMQ endpoint a replica's ``KvEventPublisher`` should consume.
 
     With Dynamo's KVBM connector active this is the consolidator's output
     stream (which carries the engine's events bridged with KVBM's own);
