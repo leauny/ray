@@ -1,5 +1,6 @@
+import importlib.util
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ray import serve
 from ray.serve._private.constants import SERVE_LOGGER_NAME
@@ -12,15 +13,23 @@ logger = logging.getLogger(SERVE_LOGGER_NAME)
 
 # experimental_configs keys overriding the per-node base ports.
 KV_EVENTS_PORT_BASE_KEY = "KV_EVENTS_PORT_BASE"
+KV_EVENT_CONSOLIDATOR_PORT_BASE_KEY = "KV_EVENT_CONSOLIDATOR_PORT_BASE"
 DEFAULT_KV_EVENTS_PORT_BASE = 5557
+DEFAULT_KV_EVENT_CONSOLIDATOR_PORT_BASE = 57001
+
+# Dynamo's KVBM vLLM connector (consumed through vLLM's KVTransferConfig).
+DYNAMO_KV_CONNECTOR = "DynamoConnector"
+DYNAMO_KV_CONNECTOR_MODULE_PATH = "kvbm.vllm_integration.connector"
+CONSOLIDATOR_ENDPOINTS_KEY = "consolidator_endpoints"
 
 
 def configure_kv_events_for_kv_routing(llm_config: "LLMConfig") -> None:
     """Enable engine KV-cache events for a KV-aware-routed deployment.
 
     Sets up ``engine_kwargs`` so the engine publishes KV-cache events over
-    ZMQ. Called at deployment build time; the endpoint is finalized per
-    replica by :func:`assign_replica_kv_events_endpoint`.
+    ZMQ, and selects Dynamo's KVBM connector when it is installed. Called at
+    deployment build time; the endpoint is finalized per replica by
+    :func:`assign_replica_kv_events_endpoint`.
     """
     engine_kwargs = llm_config.engine_kwargs
     if engine_kwargs.get("enable_prefix_caching") is False:
@@ -45,6 +54,32 @@ def configure_kv_events_for_kv_routing(llm_config: "LLMConfig") -> None:
             "KV-aware routing is configured but the user-provided kv_events_config "
             "disables KV-cache events; the KV router will not see cached blocks."
         )
+
+    _maybe_enable_dynamo_connector(llm_config)
+
+
+def _maybe_enable_dynamo_connector(llm_config: "LLMConfig") -> None:
+    """Select Dynamo's KVBM connector via vLLM's KVTransferConfig.
+
+    Only injected when the ``kvbm`` package is installed (vLLM imports the
+    connector module eagerly while building its engine config) and the user
+    has not configured a connector themselves.
+    """
+    if llm_config.engine_kwargs.get("kv_transfer_config") is not None:
+        return
+    if importlib.util.find_spec("kvbm") is None:
+        logger.info(
+            "Dynamo KVBM connector is not installed; KV-aware routing will "
+            "consume the engine's KV events directly."
+        )
+        return
+    llm_config.update_engine_kwargs(
+        kv_transfer_config={
+            "kv_connector": DYNAMO_KV_CONNECTOR,
+            "kv_connector_module_path": DYNAMO_KV_CONNECTOR_MODULE_PATH,
+            "kv_role": "kv_both",
+        }
+    )
 
 
 def assign_replica_kv_events_endpoint(llm_config: "LLMConfig") -> None:
@@ -77,13 +112,47 @@ def assign_replica_kv_events_endpoint(llm_config: "LLMConfig") -> None:
 def resolve_kv_event_source_endpoint(llm_config: "LLMConfig") -> Optional[str]:
     """The ZMQ endpoint a replica's KV-events subscriber should consume.
 
-    The engine's KV-events endpoint; ``None`` when KV-cache events are not
-    enabled.
+    With Dynamo's KVBM connector active this is the consolidator's output
+    stream (which carries the engine's events bridged with KVBM's own);
+    otherwise it is the engine's KV-events endpoint. ``None`` when KV-cache
+    events are not enabled.
     """
     kv_events_config = _enabled_kv_events_config(llm_config)
     if kv_events_config is None:
         return None
+    if _uses_dynamo_connector(llm_config):
+        return resolve_consolidator_endpoints(llm_config)[2]
     return _engine_event_connect_endpoint(llm_config, kv_events_config)
+
+
+def resolve_consolidator_endpoints(llm_config: "LLMConfig") -> List[str]:
+    """Per-replica KVBM consolidator endpoints (RFC §4.2).
+
+    Returns ``[engine_event_endpoint, output_bind_endpoint,
+    output_connect_endpoint]``: the consolidator subscribes to the engine's
+    KV events and republishes the consolidated stream on its output port.
+    """
+    kv_events_config = _enabled_kv_events_config(llm_config)
+    if kv_events_config is None:
+        raise ValueError(
+            "The KVBM consolidator requires kv_events_config with "
+            "enable_kv_cache_events=True in engine_kwargs."
+        )
+    dp_rank = _engine_data_parallel_rank(llm_config)
+    offset = dp_rank if dp_rank is not None else _replica_rank()
+    consolidator_port = (
+        _experimental_port_base(
+            llm_config,
+            KV_EVENT_CONSOLIDATOR_PORT_BASE_KEY,
+            DEFAULT_KV_EVENT_CONSOLIDATOR_PORT_BASE,
+        )
+        + offset
+    )
+    return [
+        _engine_event_connect_endpoint(llm_config, kv_events_config),
+        f"tcp://0.0.0.0:{consolidator_port}",
+        f"tcp://127.0.0.1:{consolidator_port}",
+    ]
 
 
 def _engine_event_connect_endpoint(
@@ -100,6 +169,14 @@ def _engine_event_connect_endpoint(
     if dp_rank is not None:
         endpoint = _offset_endpoint_port(endpoint, dp_rank)
     return _to_connect_endpoint(endpoint)
+
+
+def _uses_dynamo_connector(llm_config: "LLMConfig") -> bool:
+    kv_transfer_config = llm_config.engine_kwargs.get("kv_transfer_config")
+    return (
+        isinstance(kv_transfer_config, dict)
+        and kv_transfer_config.get("kv_connector") == DYNAMO_KV_CONNECTOR
+    )
 
 
 def _enabled_kv_events_config(llm_config: "LLMConfig") -> Optional[Dict[str, Any]]:
